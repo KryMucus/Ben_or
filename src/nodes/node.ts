@@ -3,6 +3,7 @@ import express from "express";
 import { BASE_NODE_PORT } from "../config";
 import { Value, NodeState, defaultState } from "../types";
 import axios from "axios"; // Assuming axios is used for HTTP requests
+import { delay } from "../utils";
 
 export async function node(
   nodeId: number,
@@ -17,6 +18,8 @@ export async function node(
   node.use(express.json());
   node.use(bodyParser.json());
   
+  let proposals: Map<number, Value[]> = new Map();
+  let votes: Map<number, Value[]> = new Map();
 
   let nodeState: NodeState = { ...defaultState, x: initialValue,  };
   let participating = false; // Flag to indicate if the node is participating in the consensus
@@ -38,7 +41,38 @@ export async function node(
     await Promise.allSettled(requests);
   };
   
+  // Route to start the consensus algorithm
+  node.get("/start", async (req, res) => {
+    // Wait for all nodes to be ready
+    while (!nodesAreReady()) {
+      await delay(100); // Wait for 100ms before checking again
+    }
   
+    if (isFaulty) {
+      // If the node is faulty, it does not participate in the consensus
+      console.log(`Node ${nodeId} is faulty and will not start the consensus process.`);
+      res.status(400).send("Faulty node cannot start consensus");
+    } else {
+      // Initialize the node's state for the consensus process
+      participating = true; // Mark the node as participating in the consensus
+      nodeState.k = 0; // Initialize the round counter
+      nodeState.x = initialValue; // Set the initial value
+      nodeState.decided = false; // Mark the node as undecided
+  
+      // Broadcast the initial value to all other nodes to start the consensus process
+      const message = { value: nodeState.x, senderId: nodeId, round: nodeState.k, type: "2P" }; // Type "2P" indicates this is a proposal message
+      broadcastMessage(message).then(() => {
+        console.log(`Node ${nodeId} broadcasted initial value: ${JSON.stringify(message)}`);
+      }).catch(error => {
+        console.error(`Node ${nodeId} failed to broadcast initial value: ${error.message}`);
+      });
+  
+      res.status(200).send("Consensus algorithm started");
+    }
+  });
+
+
+
 
   // Route for retrieving the current status of the node
 node.get("/status", (req, res) => {
@@ -54,86 +88,85 @@ node.get("/status", (req, res) => {
     res.status(200).json(nodeState);
   });
 
-  node.post("/message", (req, res) => {
+
+  const ensureArrayForKey = (map: Map<number, Value[]>, key: number): Value[] => {
+    if (!map.has(key)) {
+      map.set(key, []);
+    }
+    return map.get(key)!; // Using non-null assertion since we just set the key if it didn't exist
+  };
+  
+  // Function to determine the decision based on vote counts
+  const determineDecision = (countNo: number, countYes: number, N: number, F: number): Value => {
+    if (countNo > N / 2) {
+      return 0;
+    } else if (countYes > N / 2) {
+      return 1;
+    } else if (countNo >= F + 1) {
+      return 0; // Decided no
+    } else if (countYes >= F + 1) {
+      return 1; // Decided yes
+    } else {
+      // Randomized decision in case of no clear majority
+      return Math.random() > 0.5 ? 0 : 1;
+    }
+  };
+  
+  node.post("/message", async (req, res) => {
     if (!participating || isFaulty || nodeState.k === null) {
-      console.log(`Node ${nodeId} not participating, is faulty, or round counter is not initialized`);
       res.status(400).send("Node not participating, is faulty, or round counter is not initialized");
       return;
     }
   
-    const { value, senderId, round } = req.body;
+    const { value, senderId, round, type } = req.body;
   
-    // Ensure parsedValue is treated as a number when it's 0 or 1
-    let parsedValue: Value;
-    if (value === 0 || value === 1) { // Directly compare with numeric values
-      parsedValue = value;
-    } else if (value === "?") {
-      parsedValue = "?";
-    } else {
-      console.error("Invalid value received:", value);
-      res.status(400).send("Invalid value received");
-      return;
-    }
+    // Handle proposal messages
+    if (type === "2P") {
+      const proposalValues: Value[] = ensureArrayForKey(proposals, round);
+      proposalValues.push(value);
   
-    // If the message is from a future round, update the node's round
-    if (round > nodeState.k) {
-      nodeState.k = round;
-    }
+      if (proposalValues.length >= N - F) {
+        const countNo: number = proposalValues.filter((val: Value) => val === 0).length;
+        const countYes: number = proposalValues.filter((val: Value) => val === 1).length;
   
-    console.log(`Node ${nodeId} received value ${parsedValue} from node ${senderId} in round ${round}`);
+        let decisionValue: Value = determineDecision(countNo, countYes, N, F);
   
-    // Update the count for received value
-    const valueAsString = String(parsedValue); // Use a string key for consistency in receivedValues object
-    receivedValues[valueAsString] = (receivedValues[valueAsString] || 0) + 1;
-  
-    // Determine the number of running nodes
-    const runningNodes = N - F;
-  
-    // Check if a value has been received from more than half of the RUNNING nodes
-    for (const val in receivedValues) {
-     // Assuming Value is defined as 0 | 1 | "?"
-      if (receivedValues[val] > runningNodes / 2) {
-        // Majority found, update node's value and round
-        nodeState.x = val === "?" ? "?" : parseInt(val, 10) as 0 | 1; // Assert that parsed value is of type 0 | 1
-        if (nodeState.k === null) {
-          nodeState.k = 0;
+        // Broadcast decision for voting if not "?"
+        if (decisionValue !== "?") { // Type mismatch is addressed here by ensuring decisionValue cannot be "?"
+          const voteMessage = { value: decisionValue, senderId: nodeId, round, type: "2V" };
+          broadcastMessage(voteMessage);
         }
-        nodeState.k++; // Move to the next round
-        nodeState.decided = true; // Node has made a decision
-        console.log(`Node ${nodeId} updates its value to ${val} in round ${nodeState.k}`);
-        broadcastMessage({ value: nodeState.x, senderId: nodeId, round: nodeState.k });
-
-      } else if (receivedValues[val] === runningNodes / 2) {
-        // Tie: Use a randomized value and update round
-        const randomValue = Math.random() < 0.5 ? 0 : 1; // Directly assign 0 or 1
-        nodeState.x = randomValue as 0 | 1; // Assert that randomValue is of type 0 | 1
-        if (nodeState.k === null) {
-          nodeState.k = 0;
-        }
-        nodeState.k++; // Move to the next round
-        console.log(`Node ${nodeId} resolves tie with random value ${randomValue} in round ${nodeState.k}`);
-        broadcastMessage({ value: nodeState.x, senderId: nodeId, round: nodeState.k });
       }
-
-        
-    res.status(200).send("Message received and processed");}
+    }
+    // Handle vote messages
+    else if (type === "2V") {
+      const voteValues: Value[] = ensureArrayForKey(votes, round);
+      voteValues.push(value);
+  
+      if (voteValues.length >= N - F) {
+        const countNo: number = voteValues.filter((val: Value) => val === 0).length;
+        const countYes: number = voteValues.filter((val: Value) => val === 1).length;
+  
+        nodeState.x = determineDecision(countNo, countYes, N, F);
+        nodeState.decided = [0, 1].includes(+nodeState.x); // Ensures that decided is true only if x is 0 or 1
+        if (!nodeState.decided) {
+          nodeState.k = round + 1;
+          // Prepare to initiate a new round of proposals
+          const newProposalMessage = { value: nodeState.x, senderId: nodeId, round: nodeState.k, type: "2P" };
+          broadcastMessage(newProposalMessage);
+        }
+      }
+    }
+  
+    res.status(200).send("Message received and processed");
   });
   
   
   
+  
 
-  // Route to start the consensus algorithm
-node.get("/start", async (req, res) => {
-  if (!isFaulty) {
-    participating = true;
-    nodeState.k = 0; // Initialize the round counter when consensus starts
-    // Broadcast initial value to all other nodes
-    await broadcastMessage({ value: nodeState.x, senderId: nodeId, round: nodeState.k });
-    res.status(200).send("Consensus algorithm started");
-  } else {
-    res.status(400).send("Faulty node cannot start consensus");
-  }
-});
+
+  
 
 
   // Corrected /stop route
